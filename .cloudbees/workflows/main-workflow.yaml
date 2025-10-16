@@ -193,6 +193,7 @@ jobs:
       low_count: ${{ steps.fetch-vulns.outputs.low_count }}
       total_count: ${{ steps.fetch-vulns.outputs.total_count }}
       scan_datetime: ${{ steps.fetch-vulns.outputs.scan_datetime }}
+      gate_triggered: ${{ steps.fetch-vulns.outputs.gate_triggered }}
     steps:
       - name: Fetch Security Vulnerabilities
         id: fetch-vulns
@@ -239,6 +240,21 @@ jobs:
           LOW_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "LOW")) | length')
           TOTAL_COUNT=$(echo "$RESPONSE" | jq '.issues | length')
 
+          # ENHANCED DUAL-THRESHOLD LOGIC: VERY HIGH ≥4 OR HIGH ≥6
+          GATE_TRIGGERED="false"
+          if [ "$VERY_HIGH_COUNT" -ge 4 ] || [ "$HIGH_COUNT" -ge 6 ]; then
+            GATE_TRIGGERED="true"
+            echo "🚨 DUAL-THRESHOLD SECURITY GATE TRIGGERED!"
+            echo "   - VERY HIGH: $VERY_HIGH_COUNT (threshold: ≥4)"
+            echo "   - HIGH: $HIGH_COUNT (threshold: ≥6)"
+            echo "   - Gate Logic: VERY HIGH ≥4 OR HIGH ≥6"
+          else
+            echo "✅ DUAL-THRESHOLD SECURITY GATE PASSED"
+            echo "   - VERY HIGH: $VERY_HIGH_COUNT (<4)"
+            echo "   - HIGH: $HIGH_COUNT (<6)"
+            echo "   - Gate Logic: VERY HIGH <4 AND HIGH <6"
+          fi
+
           # Output results
           echo "$HIGH_COUNT" > $CLOUDBEES_OUTPUTS/vuln_count
           echo "$VERY_HIGH_COUNT" > $CLOUDBEES_OUTPUTS/very_high_count
@@ -248,8 +264,9 @@ jobs:
           echo "$TOTAL_COUNT" > $CLOUDBEES_OUTPUTS/total_count
           echo "$SCAN_DATETIME" > $CLOUDBEES_OUTPUTS/scan_datetime
           echo "HIGH" > $CLOUDBEES_OUTPUTS/severity_level
+          echo "$GATE_TRIGGERED" > $CLOUDBEES_OUTPUTS/gate_triggered
 
-          echo "🔍 Security Scan Results:"
+          echo "🔍 Enhanced Security Scan Results:"
           echo "- VERY HIGH Vulnerabilities: $VERY_HIGH_COUNT"
           echo "- HIGH Vulnerabilities: $HIGH_COUNT"
           echo "- MEDIUM Vulnerabilities: $MEDIUM_COUNT"
@@ -259,61 +276,77 @@ jobs:
           if [ "${{ secrets.WES_1Time_Bypass }}" = "TRUE" ]; then
             echo "- Security Gate: BYPASSED (Admin override)"
           else
-            echo "- Security Gate Required: $([ $HIGH_COUNT -ge 6 ] && echo 'YES (≥6 High)' || echo 'NO (<6 High)')"
+            echo "- Security Gate Required: $([ "$GATE_TRIGGERED" = "true" ] && echo 'YES (Dual-threshold breach)' || echo 'NO (Within thresholds)')"
           fi
 
-      - name: Generate Security Evidence Report
+          echo "🎯 Deploy Job Advancement Conditions:"
+          echo "   - Bypass Active: $([ "${{ secrets.WES_1Time_Bypass }}" = "TRUE" ] && echo 'YES - Deploy allowed' || echo 'NO')"
+          echo "   - Gate Triggered: $([ "$GATE_TRIGGERED" = "true" ] && echo 'YES - Must pass security-gate' || echo 'NO - Deploy allowed')"
+          echo "   - Final Decision: $([ "${{ secrets.WES_1Time_Bypass }}" = "TRUE" ] && echo 'DEPLOY (bypass)' || ([ "$GATE_TRIGGERED" = "true" ] && echo 'SECURITY-GATE REQUIRED' || echo 'DEPLOY (passed)'))"
+
+      - name: Generate Enhanced Security Evidence Report
         uses: cloudbees-io/publish-evidence-item@v1
         with:
           content: |-
-            # Security Vulnerability Report
+            # Enhanced Dual-Threshold Security Vulnerability Report
 
             **Component:** ${{ cloudbees.component.id }}
             **Security Check Date & Time:** ${{ steps.fetch-vulns.outputs.scan_datetime }}
             **Total Vulnerabilities:** ${{ steps.fetch-vulns.outputs.total_count }}
             **Data Source:** Real-time CloudBees Unify REST API
 
-            ## Severity Breakdown
-            | Severity | Count |
-            |----------|-------|
-            | Very High | ${{ steps.fetch-vulns.outputs.very_high_count }} |
-            | High | ${{ steps.fetch-vulns.outputs.high_count }} |
-            | Medium | ${{ steps.fetch-vulns.outputs.medium_count }} |
-            | Low | ${{ steps.fetch-vulns.outputs.low_count }} |
-            | **TOTAL** | ${{ steps.fetch-vulns.outputs.total_count }} |
+            ## Enhanced Dual-Threshold Security Logic
+            **Gate Triggered:** ${{ steps.fetch-vulns.outputs.gate_triggered }}
+            **Trigger Logic:** VERY HIGH ≥4 OR HIGH ≥6 activates 30-minute security gate
+            **Success Criteria:** VERY HIGH <4 AND HIGH <6 to proceed to deployment
 
-            ## Security Gate Decision
-            One-time bypass check: Administrative override capability available
+            ## Severity Breakdown with Thresholds
+            | Severity | Count | Threshold | Status |
+            |----------|-------|-----------|--------|
+            | Very High | ${{ steps.fetch-vulns.outputs.very_high_count }} | ≥4 triggers gate | ${{ steps.fetch-vulns.outputs.very_high_count >= 4 && '❌ BREACH' || '✅ SAFE' }} |
+            | High | ${{ steps.fetch-vulns.outputs.high_count }} | ≥6 triggers gate | ${{ steps.fetch-vulns.outputs.high_count >= 6 && '❌ BREACH' || '✅ SAFE' }} |
+            | Medium | ${{ steps.fetch-vulns.outputs.medium_count }} | - | - |
+            | Low | ${{ steps.fetch-vulns.outputs.low_count }} | - | - |
+            | **TOTAL** | ${{ steps.fetch-vulns.outputs.total_count }} | - | - |
 
-            ## Risk Assessment
-            - **Critical Risk**: ${{ steps.fetch-vulns.outputs.very_high_count }} Very High vulnerabilities
-            - **High Risk**: ${{ steps.fetch-vulns.outputs.high_count }} High severity vulnerabilities
+            ## Deploy Job Advancement Analysis
+            - **Bypass Status:** ${{ secrets.WES_1Time_Bypass == 'TRUE' && 'ACTIVE - Deploy allowed immediately' || 'INACTIVE - Normal gate enforcement' }}
+            - **Gate Status:** ${{ steps.fetch-vulns.outputs.gate_triggered == 'true' && 'TRIGGERED - Security gate required' || 'PASSED - Deploy allowed' }}
+            - **Final Decision:** ${{ secrets.WES_1Time_Bypass == 'TRUE' && 'DEPLOY (bypass override)' || (steps.fetch-vulns.outputs.gate_triggered == 'true' && 'SECURITY-GATE POLLING REQUIRED' || 'DEPLOY (thresholds met)') }}
+
+            ## Enhanced Risk Assessment
+            - **Critical Risk**: ${{ steps.fetch-vulns.outputs.very_high_count }} Very High vulnerabilities (4+ triggers gate)
+            - **High Risk**: ${{ steps.fetch-vulns.outputs.high_count }} High severity vulnerabilities (6+ triggers gate)
+            - **Flexible Remediation**: Developers can fix either VERY HIGH or HIGH vulnerabilities to meet criteria
             - **Total Risk**: All ${{ steps.fetch-vulns.outputs.total_count }} vulnerabilities require attention
           format: MARKDOWN
   security-gate:
     needs: security-check
-    if: ${{ secrets.WES_1Time_Bypass != 'TRUE' }}
+    if: ${{ needs.security-check.outputs.gate_triggered == 'true' && secrets.WES_1Time_Bypass != 'TRUE' }}
     outputs:
       gate_status: ${{ steps.security-polling.outputs.gate_status }}
-      final_vuln_count: ${{ steps.security-polling.outputs.final_vuln_count }}
+      final_very_high_count: ${{ steps.security-polling.outputs.final_very_high_count }}
+      final_high_count: ${{ steps.security-polling.outputs.final_high_count }}
       poll_results: ${{ steps.security-polling.outputs.poll_results }}
     steps:
-      - name: Security Gate Polling
+      - name: Enhanced Dual-Threshold Security Gate Polling
         id: security-polling
         uses: docker://alpine:latest
         run: |
           apk add --no-cache curl jq
 
-          echo "🚨 SECURITY GATE ACTIVATED 🚨"
-          echo "Initial High Vulnerabilities: ${{ needs.security-check.outputs.vuln_count }}"
-          echo "Threshold: Must be <6 to proceed"
-          echo "Polling: Every 5 minutes for 30 minutes (7 polls total)"
+          echo "🚨 ENHANCED DUAL-THRESHOLD SECURITY GATE ACTIVATED 🚨"
+          echo "Initial VERY HIGH Vulnerabilities: ${{ needs.security-check.outputs.very_high_count }}"
+          echo "Initial HIGH Vulnerabilities: ${{ needs.security-check.outputs.high_count }}"
+          echo "Success Criteria: VERY HIGH <4 AND HIGH <6 (both conditions must be met)"
+          echo "Polling Duration: 30 minutes (7 polls every 5 minutes)"
           echo ""
 
           # Initialize variables
           POLL_RESULTS=""
           GATE_STATUS="FAILED"
-          FINAL_COUNT=${{ needs.security-check.outputs.vuln_count }}
+          FINAL_VERY_HIGH_COUNT=${{ needs.security-check.outputs.very_high_count }}
+          FINAL_HIGH_COUNT=${{ needs.security-check.outputs.high_count }}
           START_TIME=$(date +%s)
           END_TIME=$((START_TIME + 1800))  # 30 minutes = 1800 seconds
           POLL_COUNT=0
@@ -327,40 +360,55 @@ jobs:
           # Build API URL with branch name
           API_URL="https://api.cloudbees.io/v1/resources/${ORG_ID}/endpoints/${ENDPOINT_ID}/asset-store/components/${COMPONENT_ID}/branches/${BRANCH_NAME}/issues"
 
+          echo "🎯 Deploy Job Advancement Tracking:"
+          echo "   - Current Status: BLOCKED (security-gate running)"
+          echo "   - Required for Deploy: VERY HIGH <4 AND HIGH <6"
+          echo "   - Alternative: WES_1Time_Exception = TRUE"
+          echo ""
+
           # Polling loop - exactly 30 minutes with 5-minute intervals
           while [ $(date +%s) -lt $END_TIME ]; do
             POLL_COUNT=$((POLL_COUNT + 1))
             POLL_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
             ELAPSED_MIN=$(( (POLL_COUNT - 1) * 5 ))
 
-            echo "🔍 High Security Check Poll #${POLL_COUNT} (${ELAPSED_MIN}:00 elapsed)"
+            echo "🔍 Enhanced Dual-Threshold Security Poll #${POLL_COUNT}/7 (${ELAPSED_MIN}:00 elapsed)"
 
-            # Make API call to check current vulnerability count
+            # Make API call to check current vulnerability counts
             RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.CLOUDBEES_API_TOKEN }}" \
             "${API_URL}?pagination.sort.order=1&pagination.sort.field_name=severity&pagination.page_length=100&pagination.page=1&triageStatus=UNREVIEWED")
 
-            # Extract current High count
+            # Extract current counts
             if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
               echo "❌ API Error during poll #${POLL_COUNT}: $(echo "$RESPONSE" | jq -r '.error')"
-              CURRENT_COUNT=${{ needs.security-check.outputs.vuln_count }}
+              CURRENT_VERY_HIGH_COUNT=${{ needs.security-check.outputs.very_high_count }}
+              CURRENT_HIGH_COUNT=${{ needs.security-check.outputs.high_count }}
             else
-              CURRENT_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "HIGH")) | length')
+              CURRENT_VERY_HIGH_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "VERY_HIGH")) | length')
+              CURRENT_HIGH_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "HIGH")) | length')
             fi
 
-            echo "   Result: ${CURRENT_COUNT} High vulnerabilities"
-            FINAL_COUNT=$CURRENT_COUNT
+            echo "   📊 Current Counts: ${CURRENT_VERY_HIGH_COUNT} VERY HIGH, ${CURRENT_HIGH_COUNT} HIGH"
+            FINAL_VERY_HIGH_COUNT=$CURRENT_VERY_HIGH_COUNT
+            FINAL_HIGH_COUNT=$CURRENT_HIGH_COUNT
 
             # Build poll results for evidence
-            POLL_RESULTS="${POLL_RESULTS}- **Poll #${POLL_COUNT}** (${POLL_TIME}): ${CURRENT_COUNT} High vulnerabilities"
+            POLL_RESULTS="${POLL_RESULTS}- **Poll #${POLL_COUNT}** (${POLL_TIME}): ${CURRENT_VERY_HIGH_COUNT} VERY HIGH, ${CURRENT_HIGH_COUNT} HIGH vulnerabilities"
 
-            # Check if we've met the criteria - Success threshold < 6 for HIGH
-            if [ $CURRENT_COUNT -lt 6 ]; then
-              echo "✅ SUCCESS: High vulnerabilities reduced to ${CURRENT_COUNT} (<6)"
+            # ENHANCED SUCCESS CRITERIA: VERY HIGH <4 AND HIGH <6
+            if [ $CURRENT_VERY_HIGH_COUNT -lt 4 ] && [ $CURRENT_HIGH_COUNT -lt 6 ]; then
+              echo "   ✅ SUCCESS: Enhanced dual-threshold criteria met!"
+              echo "      - VERY HIGH: ${CURRENT_VERY_HIGH_COUNT} (<4) ✅"
+              echo "      - HIGH: ${CURRENT_HIGH_COUNT} (<6) ✅"
+              echo "   🎯 Deploy Job Status: UNBLOCKED - Deploy job can proceed"
               POLL_RESULTS="${POLL_RESULTS} ✅ **PASSED**"$'\n'
               GATE_STATUS="PASSED"
               break
             else
-              echo "⚠️  Still ${CURRENT_COUNT} High vulnerabilities (≥6)"
+              echo "   ⚠️  Enhanced dual-threshold criteria not met:"
+              echo "      - VERY HIGH: ${CURRENT_VERY_HIGH_COUNT} $([ $CURRENT_VERY_HIGH_COUNT -ge 4 ] && echo '(≥4) ❌' || echo '(<4) ✅')"
+              echo "      - HIGH: ${CURRENT_HIGH_COUNT} $([ $CURRENT_HIGH_COUNT -ge 6 ] && echo '(≥6) ❌' || echo '(<6) ✅')"
+              echo "   🎯 Deploy Job Status: BLOCKED - Both conditions must be met"
               POLL_RESULTS="${POLL_RESULTS}"$'\n'
             fi
 
@@ -368,7 +416,7 @@ jobs:
             if [ $POLL_COUNT -ge 7 ]; then break; fi
 
             # Wait 5 minutes before next poll
-            echo "⏰ Waiting 5 minutes before next poll..."
+            echo "   ⏰ Waiting 5 minutes before next poll..."
             sleep 300
           done
 
@@ -379,28 +427,35 @@ jobs:
             if [ "${{ secrets.WES_1Time_Exception }}" = "TRUE" ]; then
               echo "🚨 ONE-TIME VULNERABILITY EXCEPTION GRANTED!"
               echo "Security gate bypassed by administrative override"
+              echo "🎯 Deploy Job Status: UNBLOCKED - Exception override active"
               GATE_STATUS="PASSED"
               POLL_RESULTS="${POLL_RESULTS}- **EXCEPTION GRANTED**: One-time vulnerability exception applied"$'\n'
             else
               echo "❌ No exception granted - Security gate enforcement active"
+              echo "🎯 Deploy Job Status: BLOCKED - Criteria not met, no exception"
             fi
           fi
 
           # Final status
           if [ "$GATE_STATUS" = "PASSED" ]; then
             echo ""
-            echo "🎉 SECURITY GATE PASSED!"
-            echo "Final High vulnerability count: ${FINAL_COUNT}"
+            echo "🎉 ENHANCED DUAL-THRESHOLD SECURITY GATE PASSED!"
+            echo "Final VERY HIGH vulnerability count: ${FINAL_VERY_HIGH_COUNT}"
+            echo "Final HIGH vulnerability count: ${FINAL_HIGH_COUNT}"
+            echo "🎯 Deploy Job Advancement: APPROVED - All conditions met"
           else
             echo ""
-            echo "❌ SECURITY GATE FAILED!"
-            echo "Final High vulnerability count: ${FINAL_COUNT}"
-            echo "Developer did not meet the Security Criteria of fixing High Vulnerabilities!"
+            echo "❌ ENHANCED DUAL-THRESHOLD SECURITY GATE FAILED!"
+            echo "Final VERY HIGH vulnerability count: ${FINAL_VERY_HIGH_COUNT}"
+            echo "Final HIGH vulnerability count: ${FINAL_HIGH_COUNT}"
+            echo "🎯 Deploy Job Advancement: BLOCKED - Enhanced security criteria not met"
+            echo "Developer must fix vulnerabilities to meet: VERY HIGH <4 AND HIGH <6"
           fi
 
           # Output results
           echo "$GATE_STATUS" > $CLOUDBEES_OUTPUTS/gate_status
-          echo "$FINAL_COUNT" > $CLOUDBEES_OUTPUTS/final_vuln_count
+          echo "$FINAL_VERY_HIGH_COUNT" > $CLOUDBEES_OUTPUTS/final_very_high_count
+          echo "$FINAL_HIGH_COUNT" > $CLOUDBEES_OUTPUTS/final_high_count
           echo "$POLL_RESULTS" > $CLOUDBEES_OUTPUTS/poll_results
 
           # Exit with error if gate failed
@@ -408,24 +463,39 @@ jobs:
             exit 1
           fi
 
-      - name: Publish Security Gate Evidence
+      - name: Publish Enhanced Security Gate Evidence
         uses: cloudbees-io/publish-evidence-item@v1
         with:
           content: |-
-            # Security Gate Polling Results
+            # Enhanced Dual-Threshold Security Gate Results
 
             **Gate Status:** ${{ steps.security-polling.outputs.gate_status }}
-            **Initial High Count:** ${{ needs.security-check.outputs.vuln_count }}
-            **Final High Count:** ${{ steps.security-polling.outputs.final_vuln_count }}
+            **Initial VERY HIGH Count:** ${{ needs.security-check.outputs.very_high_count }}
+            **Initial HIGH Count:** ${{ needs.security-check.outputs.high_count }}
+            **Final VERY HIGH Count:** ${{ steps.security-polling.outputs.final_very_high_count }}
+            **Final HIGH Count:** ${{ steps.security-polling.outputs.final_high_count }}
             **Polling Duration:** 30 minutes (7 polls every 5 minutes)
+
+            ## Enhanced Dual-Threshold Security Logic
+            **Success Criteria:** VERY HIGH <4 AND HIGH <6 (both conditions must be met)
+            **Gate Trigger:** VERY HIGH ≥4 OR HIGH ≥6 (either condition triggers gate)
+            **Flexible Remediation:** Developers can focus on either vulnerability type for fastest resolution
+
+            ## Deploy Job Advancement Analysis
+            - **Gate Result:** ${{ steps.security-polling.outputs.gate_status }}
+            - **Deploy Status:** ${{ steps.security-polling.outputs.gate_status == 'PASSED' && 'APPROVED - Deploy job can proceed' || 'BLOCKED - Enhanced security criteria not met' }}
+            - **Required Action:** ${{ steps.security-polling.outputs.gate_status == 'PASSED' && 'None - All conditions satisfied' || 'Fix vulnerabilities to meet VERY HIGH <4 AND HIGH <6' }}
 
             ## Polling Timeline
             ${{ steps.security-polling.outputs.poll_results }}
 
-            ## Gate Decision
-            Security gate threshold: <6 High vulnerabilities required to proceed
+            ## Enhanced Security Gate Benefits
+            - **Dual Protection:** Guards against both critical (VERY HIGH) and significant (HIGH) vulnerabilities
+            - **Developer Flexibility:** Multiple remediation paths to meet security criteria
+            - **Real-time Monitoring:** Continuous assessment during 30-minute window
+            - **Administrative Controls:** Bypass and exception capabilities for urgent deployments
 
-            **Result:** Deployment status based on final vulnerability count
+            **Result:** ${{ steps.security-polling.outputs.gate_status == 'PASSED' && 'Enhanced security standards met - deployment approved' || 'Enhanced security standards not met - deployment blocked' }}
           format: MARKDOWN
   deploy:
     environment: DOW Production
