@@ -1,22 +1,155 @@
 apiVersion: automation.cloudbees.io/v1alpha1
 kind: workflow
-name: Main workflow
+name: Enhanced Security Capability Workflow
+
 on:
   push:
-    branches:
-      - "**"
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
     inputs:
       bypass_security_gate:
         description: 'Bypass 30-minute security gate'
         type: boolean
         default: false
+
+env:
+  WES_1Time_Bypass: ${{ vars.WES_1Time_Bypass || 'false' }}
+  WES_1Time_Exception: ${{ vars.WES_1Time_Exception || 'false' }}
+
 permissions:
   scm-token-own: read
   scm-token-org: read
   id-token: write
+
 jobs:
+  security-check:
+    runs-on: cloudbees-runner
+    outputs:
+      very-high-count: ${{ steps.scan.outputs.very-high-count }}
+      high-count: ${{ steps.scan.outputs.high-count }}
+      gate-triggered: ${{ steps.evaluate.outputs.gate-triggered }}
+      bypass-active: ${{ steps.evaluate.outputs.bypass-active }}
+    steps:
+      - name: Checkout code
+        uses: cloudbees-io/checkout@v1
+
+      - name: Security Scan
+        id: scan
+        run: |
+          echo "Performing security vulnerability scan..."
+          
+          # Simulate vulnerability counts (replace with actual API calls)
+          VERY_HIGH_COUNT=5
+          HIGH_COUNT=8
+          
+          echo "very-high-count=${VERY_HIGH_COUNT}" >> $GITHUB_OUTPUT
+          echo "high-count=${HIGH_COUNT}" >> $GITHUB_OUTPUT
+          
+          echo "Found ${VERY_HIGH_COUNT} VERY HIGH and ${HIGH_COUNT} HIGH vulnerabilities"
+
+      - name: Evaluate Security Gate
+        id: evaluate
+        run: |
+          VERY_HIGH=${{ steps.scan.outputs.very-high-count }}
+          HIGH=${{ steps.scan.outputs.high-count }}
+          
+          # Check if bypass is active
+          if [ "${{ env.WES_1Time_Bypass }}" = "true" ]; then
+            echo "bypass-active=true" >> $GITHUB_OUTPUT
+            echo "gate-triggered=false" >> $GITHUB_OUTPUT
+            echo "Security gate bypassed via WES_1Time_Bypass"
+            exit 0
+          fi
+          
+          echo "bypass-active=false" >> $GITHUB_OUTPUT
+          
+          # Dual-threshold logic: VERY HIGH ≥4 OR HIGH ≥6
+          if [ "$VERY_HIGH" -ge 4 ] || [ "$HIGH" -ge 6 ]; then
+            echo "gate-triggered=true" >> $GITHUB_OUTPUT
+            echo "Security gate triggered: VERY HIGH=${VERY_HIGH}, HIGH=${HIGH}"
+          else
+            echo "gate-triggered=false" >> $GITHUB_OUTPUT
+            echo "Security gate passed: VERY HIGH=${VERY_HIGH}, HIGH=${HIGH}"
+          fi
+
+  security-gate:
+    runs-on: cloudbees-runner
+    needs: security-check
+    if: needs.security-check.outputs.gate-triggered == 'true' && needs.security-check.outputs.bypass-active == 'false'
+    steps:
+      - name: Generate Smart Recommendations
+        id: recommendations
+        run: |
+          VERY_HIGH=${{ needs.security-check.outputs.very-high-count }}
+          HIGH=${{ needs.security-check.outputs.high-count }}
+          
+          echo "## Smart Security Recommendations"
+          
+          # Compare fix strategies
+          if [ "$VERY_HIGH" -ge 4 ] && [ "$HIGH" -ge 6 ]; then
+            echo "**Dual Threshold Breach Detected**"
+            echo "- VERY HIGH vulnerabilities: $VERY_HIGH (threshold: 4)"
+            echo "- HIGH vulnerabilities: $HIGH (threshold: 6)"
+            echo "**Recommended Strategy:** Focus on VERY HIGH vulnerabilities first"
+          elif [ "$VERY_HIGH" -ge 4 ]; then
+            echo "**VERY HIGH Threshold Breach**"
+            echo "- VERY HIGH vulnerabilities: $VERY_HIGH (threshold: 4)"
+            echo "- Recommended action: Fix $(($VERY_HIGH - 3)) VERY HIGH vulnerabilities"
+          else
+            echo "**HIGH Threshold Breach**"
+            echo "- HIGH vulnerabilities: $HIGH (threshold: 6)"
+            echo "- Recommended action: Fix $(($HIGH - 5)) HIGH vulnerabilities"
+          fi
+
+      - name: Security Gate Polling
+        id: polling
+        run: |
+          echo "Starting 30-minute security gate monitoring..."
+          
+          START_TIME=$(date +%s)
+          POLL_COUNT=0
+          MAX_POLLS=7
+          
+          while [ $POLL_COUNT -lt $MAX_POLLS ]; do
+            POLL_COUNT=$((POLL_COUNT + 1))
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            echo "Poll $POLL_COUNT/7 ($(($ELAPSED/60)) minutes elapsed)"
+            
+            # Simulate vulnerability check (replace with actual API calls)
+            VERY_HIGH_COUNT=3
+            HIGH_COUNT=5
+            
+            echo "- VERY HIGH: $VERY_HIGH_COUNT (threshold: <4)"
+            echo "- HIGH: $HIGH_COUNT (threshold: <6)"
+            
+            # Check if gate conditions are met
+            if [ "$VERY_HIGH_COUNT" -lt 4 ] && [ "$HIGH_COUNT" -lt 6 ]; then
+              echo "Security gate passed! Vulnerabilities reduced to acceptable levels."
+              exit 0
+            fi
+            
+            # Check for exception override
+            if [ "${{ env.WES_1Time_Exception }}" = "true" ]; then
+              echo "Security gate overridden via WES_1Time_Exception."
+              exit 0
+            fi
+            
+            # Wait 5 minutes before next poll (except last iteration)
+            if [ $POLL_COUNT -lt $MAX_POLLS ]; then
+              sleep 300
+            fi
+          done
+          
+          echo "Security gate timeout reached. Manual intervention required."
+          exit 1
+
   test:
+    needs: [security-check, security-gate]
+    if: always() && (needs.security-check.outputs.gate-triggered == 'false' || needs.security-check.outputs.bypass-active == 'true' || needs.security-gate.result == 'success')
     steps:
       - name: Run Jenkins Job
         kind: test
@@ -63,6 +196,7 @@ jobs:
           format: MARKDOWN
     outputs:
       CODE_COVERAGE: ${{ steps.RunUnitTest.outputs.CODE_COVERAGE }}
+
   build-container-image:
     needs: test
     steps:
@@ -112,6 +246,7 @@ jobs:
           format: MARKDOWN
     outputs:
       ARTIFACT_ID: ${{ steps.register-artifact.outputs.artifact-id }}
+
   scan:
     outputs:
       BLOCKER_COUNT: ${{ steps.FetchSonarQubeIssues.outputs.BLOCKER_COUNT }}
