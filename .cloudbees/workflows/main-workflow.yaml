@@ -1,0 +1,677 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: workflow
+name: Main workflow
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      bypass_security_gate:
+        description: 'Bypass 30-minute security gate'
+        type: boolean
+        default: false
+permissions:
+  scm-token-own: read
+  scm-token-org: read
+  id-token: write
+jobs:
+  test:
+    steps:
+      - name: Run Jenkins Job
+        kind: test
+        uses: cloudbees-io/jenkins-run-job@v2
+        continue-on-error: true
+        with:
+          url: https://sda.preview.cb-demos.io/westest/
+          username: ${{ secrets.WES_JENKINS_USERNAME }}
+          token: ${{ secrets.WES_JENKINS_TOKEN }}
+          job-name: WesTestMB4/job/main/
+      - name: Run GHA Workflow
+        uses: cloudbees-io/ghactions-run-workflow@v2
+        continue-on-error: true
+        with:
+          token: ${{ secrets.WES_GH_TOKEN }}
+          org-name: cloudbees-days
+          repo-name: hackers-WesTest1016
+          branch-name: main
+          workflow-name: test-and-build-image2
+          test-type: JUnit
+          test-result-location: junit.xml
+      - name: Get source code
+        uses: cloudbees-io/checkout@v1
+        continue-on-error: true
+      - name: Run unit tests
+        kind: test
+        id: RunUnitTest
+        uses: docker://node:lts
+        run: |
+          npm ci
+          npm run test:unit
+          npx jest --coverage >> $CLOUDBEES_OUTPUTS/CODE_COVERAGE
+      - name: Publish test results
+        uses: cloudbees-io/publish-test-results@v1
+        with:
+          test-type: JUnit
+          folder-name: ${{ cloudbees.workspace }}/junit.xml
+      - name: Publish evidence
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            ## Test code coverage
+            ${{ steps.RunUnitTest.outputs.CODE_COVERAGE }}
+          format: MARKDOWN
+    outputs:
+      CODE_COVERAGE: ${{ steps.RunUnitTest.outputs.CODE_COVERAGE }}
+  build-container-image:
+    needs: test
+    steps:
+      - uses: cloudbees-io/checkout@v1
+        name: Get source code
+        kind: build
+        continue-on-error: true
+      - uses: cloudbees-io/configure-oci-credentials@v1
+        name: Configure container registry credentials
+        continue-on-error: true
+        id: dockerconfig
+        with:
+          registry: https://index.docker.io/v1/
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: cloudbees-io/kaniko@v1
+        name: Build container image
+        kind: build
+        with:
+          destination: ${{ secrets.DOCKERHUB_USER }}/hackers-organized:${{ cloudbees.scm.sha }}
+          tar-path: container-image.tar
+          build-args: BUILDKIT_CONTEXT_KEEP_GIT_DIR=1,BUILDKIT_INLINE_CACHE=1
+      - uses: cloudbees-io/asset-chain-utils-preprod/upload-binary@v1
+        name: Upload binary from container build
+        id: upload-binary
+        with:
+          file-path: container-image.tar
+          file-type: BINARY_CONTAINER
+          debug: "true"
+      - name: Register build artifact
+        id: register-artifact
+        uses: cloudbees-io/register-build-artifact@v2
+        with:
+          name: "ldonleycb/hackers-organized"
+          version: "${{ cloudbees.scm.sha }}"
+          url: "${{ secrets.DOCKERHUB_USER }}/hackers-organized:${{ cloudbees.scm.sha }}"
+      - name: Publish evidence
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            ## Built and pushed image to docker hub
+
+            [Docker Hub](https://hub.docker.com/repository/docker/ldonleycb/hackers-organized/tags)
+
+            **Artifact ID:** ${{ steps.register-artifact.outputs.artifact-id }}
+            **Image:** hackers-organized:${{ cloudbees.scm.sha }}
+          format: MARKDOWN
+    outputs:
+      ARTIFACT_ID: ${{ steps.register-artifact.outputs.artifact-id }}
+  scan:
+    outputs:
+      BLOCKER_COUNT: ${{ steps.FetchSonarQubeIssues.outputs.BLOCKER_COUNT }}
+      CRITICAL_COUNT: ${{ steps.FetchSonarQubeIssues.outputs.CRITICAL_COUNT }}
+      MAJOR_COUNT: ${{ steps.FetchSonarQubeIssues.outputs.MAJOR_COUNT }}
+      MINOR_COUNT: ${{ steps.FetchSonarQubeIssues.outputs.MINOR_COUNT }}
+    steps:
+      - name: Checkout
+        uses: cloudbees-io/checkout@v1
+      - name: Get code coverage
+        kind: test
+        uses: docker://node:lts
+        run: |
+          npm ci
+          npm run test:coverage
+      - uses: cloudbees-io/sonarqube-bundled-sast-scan-code@v1
+        name: Scan with SonarQube
+        kind: scan
+        continue-on-error: true
+        with:
+          language: LANGUAGE_JS
+          cover-file-name: coverage/clover.xml
+          sonar-exclusion: tests/*
+      - uses: cloudbees-io/snyk-sast-scan-code@v1
+        name: Synk SAST
+        kind: scan
+        continue-on-error: true
+        with:
+          orgname: ${{ secrets.SNYK_ORGNAME }}
+          token: ${{ secrets.SNYK_TOKEN }}
+          language: LANGUAGE_JS
+      - name: Scan with Snyk SCA
+        uses: cloudbees-io/snyk-sca-scan-dependency@v1
+        continue-on-error: true
+        with:
+          orgname: ${{ secrets.SNYK_ORGNAME }}
+          token: ${{ secrets.SNYK_TOKEN }}
+          language: LANGUAGE_JS
+      - name: Fetch SonarQube Issues
+        id: FetchSonarQubeIssues
+        uses: docker://alpine/git:latest
+        run: |
+          apk add --no-cache curl jq
+          curl -u ${{ secrets.SONAR_USER }}:${{ secrets.SONAR_TOKEN }} \
+          "https://sonarqube.cb-demos.io/api/issues/search?componentKeys=hackers-WesTest1015&severities=BLOCKER,CRITICAL,MAJOR,MINOR" \
+          -o sonar-issues.json
+          BLOCKER_COUNT=$(jq '[.issues[] | select(.severity=="BLOCKER")] | length' sonar-issues.json)
+          CRITICAL_COUNT=$(jq '[.issues[] | select(.severity=="CRITICAL")] | length' sonar-issues.json)
+          MAJOR_COUNT=$(jq '[.issues[] | select(.severity=="MAJOR")] | length' sonar-issues.json)
+          MINOR_COUNT=$(jq '[.issues[] | select(.severity=="MINOR")] | length' sonar-issues.json)
+
+          echo "${BLOCKER_COUNT}" >> $CLOUDBEES_OUTPUTS/BLOCKER_COUNT
+          echo "${CRITICAL_COUNT}" >> $CLOUDBEES_OUTPUTS/CRITICAL_COUNT
+          echo "${MAJOR_COUNT}" >> $CLOUDBEES_OUTPUTS/MAJOR_COUNT
+          echo "${MINOR_COUNT}" >> $CLOUDBEES_OUTPUTS/MINOR_COUNT
+      - name: Publish evidence
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            ## SonarQube Analysis Results
+
+            | Severity             | Issue Count |
+            |----------------------|-------------|
+            | BLOCKER_COUNT        | ${{ steps.FetchSonarQubeIssues.outputs.BLOCKER_COUNT }} |
+            | CRITICAL_COUNT       | ${{ steps.FetchSonarQubeIssues.outputs.CRITICAL_COUNT }} |
+            | MAJOR_COUNT          | ${{ steps.FetchSonarQubeIssues.outputs.MAJOR_COUNT }} |
+            | MINOR_COUNT          | ${{ steps.FetchSonarQubeIssues.outputs.MINOR_COUNT }} |
+          format: MARKDOWN
+  security-check:
+    needs:
+      - build-container-image
+      - scan
+    outputs:
+      vuln_count: ${{ steps.fetch-vulns.outputs.vuln_count }}
+      severity_level: ${{ steps.fetch-vulns.outputs.severity_level }}
+      very_high_count: ${{ steps.fetch-vulns.outputs.very_high_count }}
+      high_count: ${{ steps.fetch-vulns.outputs.high_count }}
+      medium_count: ${{ steps.fetch-vulns.outputs.medium_count }}
+      low_count: ${{ steps.fetch-vulns.outputs.low_count }}
+      total_count: ${{ steps.fetch-vulns.outputs.total_count }}
+      scan_datetime: ${{ steps.fetch-vulns.outputs.scan_datetime }}
+      gate_required: ${{ steps.fetch-vulns.outputs.gate_required }}
+      recommendation: ${{ steps.fetch-vulns.outputs.recommendation }}
+      strategy: ${{ steps.fetch-vulns.outputs.strategy }}
+    steps:
+      - name: Enhanced Security Vulnerability Assessment
+        id: fetch-vulns
+        uses: docker://alpine:latest
+        run: |
+          apk add --no-cache curl jq bc
+
+          SCAN_DATETIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+          # Check WES bypass (updated from MARK)
+          if [ "${{ secrets.WES_1Time_Bypass }}" = "TRUE" ]; then
+            echo "🚨 ONE-TIME SECURITY GATE BYPASS GRANTED!"
+            echo "Security gate will be skipped regardless of vulnerability count"
+          else
+            echo "✅ No bypass active - normal dual-threshold security gate enforcement"
+          fi
+
+          # Dynamic CloudBees context variables
+          COMPONENT_ID="${{ cloudbees.component.id }}"
+          ORG_ID="${{ cloudbees.org.id }}"
+          ENDPOINT_ID="e8c14f62-66e8-4846-a077-3b9a887a7255"
+          BRANCH_NAME="${{ cloudbees.scm.branch }}"
+
+          echo "🔍 Component: $COMPONENT_ID"
+          echo "🔍 Branch: $BRANCH_NAME"
+
+          # Build CloudBees Unify REST API URL
+          API_URL="https://api.cloudbees.io/v1/resources/${ORG_ID}/endpoints/${ENDPOINT_ID}/asset-store/components/${COMPONENT_ID}/branches/${BRANCH_NAME}/issues"
+          echo "✅ CloudBees Unify API URL: $API_URL"
+
+          # Make vulnerability API call
+          RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.CLOUDBEES_API_TOKEN }}" \
+          "${API_URL}?pagination.sort.order=1&pagination.sort.field_name=severity&pagination.page_length=100&pagination.page=1&triageStatus=UNREVIEWED")
+
+          # Validate API response
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "❌ Vulnerability API Error: $(echo "$RESPONSE" | jq -r '.error')"
+            echo "Security check failed - unable to retrieve vulnerability data"
+            exit 1
+          fi
+
+          # Extract vulnerability counts
+          VERY_HIGH_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "VERY_HIGH")) | length')
+          HIGH_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "HIGH")) | length')
+          MEDIUM_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "MEDIUM")) | length')
+          LOW_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "LOW")) | length')
+          TOTAL_COUNT=$(echo "$RESPONSE" | jq '.issues | length')
+
+          # Dual-threshold gate logic
+          GATE_REQUIRED="false"
+          if [ $VERY_HIGH_COUNT -ge 4 ] || [ $HIGH_COUNT -ge 6 ]; then
+            GATE_REQUIRED="true"
+          fi
+
+          # Smart recommendation algorithm
+          VERY_HIGH_EFFORT=$((VERY_HIGH_COUNT > 3 ? VERY_HIGH_COUNT - 3 : 0))
+          HIGH_EFFORT=$((HIGH_COUNT > 5 ? HIGH_COUNT - 5 : 0))
+
+          if [ "$GATE_REQUIRED" = "true" ]; then
+            if [ $VERY_HIGH_EFFORT -gt 0 ] && [ $HIGH_EFFORT -gt 0 ]; then
+              if [ $VERY_HIGH_EFFORT -le $HIGH_EFFORT ]; then
+                RECOMMENDATION="🎯 RECOMMENDED: Focus on VERY HIGH vulnerabilities (${VERY_HIGH_EFFORT} fixes needed vs ${HIGH_EFFORT} HIGH fixes)"
+                STRATEGY="Faster path to deployment - typically Docker/dependency updates"
+              else
+                RECOMMENDATION="🎯 RECOMMENDED: Focus on HIGH vulnerabilities (${HIGH_EFFORT} fixes needed vs ${VERY_HIGH_EFFORT} VERY HIGH fixes)"
+                STRATEGY="More fixes required but often simpler code changes"
+              fi
+            elif [ $VERY_HIGH_EFFORT -gt 0 ]; then
+              RECOMMENDATION="🎯 REQUIRED: Fix VERY HIGH vulnerabilities (${VERY_HIGH_EFFORT} fixes needed)"
+              STRATEGY="Focus on critical security issues - Docker/dependency updates recommended"
+            else
+              RECOMMENDATION="🎯 REQUIRED: Fix HIGH vulnerabilities (${HIGH_EFFORT} fixes needed)"
+              STRATEGY="Focus on significant security issues - code and configuration changes"
+            fi
+          else
+            RECOMMENDATION="✅ No security gate required - vulnerability thresholds met"
+            STRATEGY="Proceed to deployment - security criteria satisfied"
+          fi
+
+          # Output results
+          echo "$HIGH_COUNT" > $CLOUDBEES_OUTPUTS/vuln_count
+          echo "$VERY_HIGH_COUNT" > $CLOUDBEES_OUTPUTS/very_high_count
+          echo "$HIGH_COUNT" > $CLOUDBEES_OUTPUTS/high_count
+          echo "$MEDIUM_COUNT" > $CLOUDBEES_OUTPUTS/medium_count
+          echo "$LOW_COUNT" > $CLOUDBEES_OUTPUTS/low_count
+          echo "$TOTAL_COUNT" > $CLOUDBEES_OUTPUTS/total_count
+          echo "$SCAN_DATETIME" > $CLOUDBEES_OUTPUTS/scan_datetime
+          echo "$GATE_REQUIRED" > $CLOUDBEES_OUTPUTS/gate_required
+          echo "$RECOMMENDATION" > $CLOUDBEES_OUTPUTS/recommendation
+          echo "$STRATEGY" > $CLOUDBEES_OUTPUTS/strategy
+          echo "DUAL_THRESHOLD" > $CLOUDBEES_OUTPUTS/severity_level
+
+          echo ""
+          echo "🔍 Enhanced Security Assessment Results:"
+          echo "- VERY HIGH Vulnerabilities: $VERY_HIGH_COUNT (Threshold: <4)"
+          echo "- HIGH Vulnerabilities: $HIGH_COUNT (Threshold: <6)"
+          echo "- MEDIUM Vulnerabilities: $MEDIUM_COUNT"
+          echo "- LOW Vulnerabilities: $LOW_COUNT"
+          echo "- TOTAL Vulnerabilities: $TOTAL_COUNT"
+          echo ""
+
+          if [ "${{ secrets.WES_1Time_Bypass }}" = "TRUE" ]; then
+            echo "- Security Gate: BYPASSED (Administrative override)"
+          else
+            echo "- Dual-Threshold Analysis:"
+            echo "  * VERY HIGH ≥4: $([ $VERY_HIGH_COUNT -ge 4 ] && echo 'YES' || echo 'NO') ($VERY_HIGH_COUNT ≥ 4)"
+            echo "  * HIGH ≥6: $([ $HIGH_COUNT -ge 6 ] && echo 'YES' || echo 'NO') ($HIGH_COUNT ≥ 6)"
+            echo "  * Security Gate Required: $GATE_REQUIRED"
+            echo ""
+            echo "- Smart Recommendation: $RECOMMENDATION"
+            echo "- Strategy: $STRATEGY"
+          fi
+
+      - name: Generate Enhanced Security Evidence Report
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            # 🛡️ Security Vulnerability Assessment Report
+
+            ## Executive Summary
+            **Component ID:** ${{ cloudbees.component.id }}  
+            **Organization:** HackersOrganized  
+            **Assessment Timestamp:** ${{ steps.fetch-vulns.outputs.scan_datetime }}  
+            **Data Source:** CloudBees Unify REST API (Real-time)  
+            **Report Version:** 2.0 (Dual-Threshold Analysis)
+
+            ## 🎯 Dual-Threshold Security Gate Analysis
+
+            ### Current Vulnerability Profile
+            | Severity Level | Count | Threshold | Status | Gap Analysis |
+            |----------------|-------|-----------|--------|--------------|
+            | **VERY HIGH** | ${{ steps.fetch-vulns.outputs.very_high_count }} | < 4 | ${{ steps.fetch-vulns.outputs.very_high_count >= 4 && '❌ EXCEEDS' || '✅ MEETS' }} | ${{ steps.fetch-vulns.outputs.very_high_count >= 4 && format('Reduce by {0}', steps.fetch-vulns.outputs.very_high_count - 3) || 'Compliant' }} |
+            | **HIGH** | ${{ steps.fetch-vulns.outputs.high_count }} | < 6 | ${{ steps.fetch-vulns.outputs.high_count >= 6 && '❌ EXCEEDS' || '✅ MEETS' }} | ${{ steps.fetch-vulns.outputs.high_count >= 6 && format('Reduce by {0}', steps.fetch-vulns.outputs.high_count - 5) || 'Compliant' }} |
+            | Medium | ${{ steps.fetch-vulns.outputs.medium_count }} | N/A | ℹ️ Monitored | - |
+            | Low | ${{ steps.fetch-vulns.outputs.low_count }} | N/A | ℹ️ Monitored | - |
+            | **TOTAL** | ${{ steps.fetch-vulns.outputs.total_count }} | - | 📊 Complete | - |
+
+            ## 🚨 Security Gate Decision Matrix
+
+            ### Gate Trigger Analysis
+            - **VERY HIGH Threshold:** ${{ steps.fetch-vulns.outputs.very_high_count }} ≥ 4 = ${{ steps.fetch-vulns.outputs.very_high_count >= 4 && '🚨 TRIGGERS GATE' || '✅ PASSES' }}
+            - **HIGH Threshold:** ${{ steps.fetch-vulns.outputs.high_count }} ≥ 6 = ${{ steps.fetch-vulns.outputs.high_count >= 6 && '🚨 TRIGGERS GATE' || '✅ PASSES' }}
+            - **Overall Decision:** ${{ steps.fetch-vulns.outputs.gate_required == 'true' && '🚨 SECURITY GATE REQUIRED' || '✅ SECURITY GATE BYPASSED' }}
+
+            ### Developer Options (Choose One Path)
+            ${{ steps.fetch-vulns.outputs.gate_required == 'true' && '
+            **Option A - VERY HIGH Focus:**
+            - Current: ' + steps.fetch-vulns.outputs.very_high_count + ' VERY HIGH vulnerabilities
+            - Target: < 4 VERY HIGH vulnerabilities  
+            - **Action Required:** Fix ' + (steps.fetch-vulns.outputs.very_high_count > 3 && steps.fetch-vulns.outputs.very_high_count - 3 || 0) + ' VERY HIGH vulnerabilities
+            - **Estimated Effort:** 2-4 hours (typically Docker/dependency updates)
+
+            **Option B - HIGH Focus:**
+            - Current: ' + steps.fetch-vulns.outputs.high_count + ' HIGH vulnerabilities
+            - Target: < 6 HIGH vulnerabilities
+            - **Action Required:** Fix ' + (steps.fetch-vulns.outputs.high_count > 5 && steps.fetch-vulns.outputs.high_count - 5 || 0) + ' HIGH vulnerabilities  
+            - **Estimated Effort:** 4-8 hours (code changes and configuration)' || '**✅ No Action Required:** All thresholds met - proceed to deployment' }}
+
+            ### 🎯 Smart Recommendation
+            ${{ steps.fetch-vulns.outputs.recommendation }}
+
+            **Strategy:** ${{ steps.fetch-vulns.outputs.strategy }}
+
+            ## 🔍 Risk Assessment & Business Impact
+
+            ### Critical Risk Factors
+            - **VERY HIGH Vulnerabilities:** ${{ steps.fetch-vulns.outputs.very_high_count > 0 && 'Immediate security threats requiring urgent attention' || 'No critical threats detected' }}
+            - **HIGH Vulnerabilities:** ${{ steps.fetch-vulns.outputs.high_count > 0 && 'Significant security risks with potential business impact' || 'No high-risk threats detected' }}
+            - **Combined Risk Score:** ${{ steps.fetch-vulns.outputs.very_high_count >= 4 || steps.fetch-vulns.outputs.high_count >= 6 && 'CRITICAL' || steps.fetch-vulns.outputs.very_high_count > 0 || steps.fetch-vulns.outputs.high_count > 0 && 'MODERATE' || 'LOW' }}
+
+            ### Compliance & Regulatory Impact
+            - **Security Standards:** ${{ steps.fetch-vulns.outputs.gate_required == 'true' && 'Exceeds acceptable risk thresholds' || 'Meets security standards' }}
+            - **Deployment Readiness:** ${{ steps.fetch-vulns.outputs.gate_required == 'true' && '❌ Not approved for production deployment' || '✅ Approved for production deployment' }}
+            - **Remediation Required:** ${{ steps.fetch-vulns.outputs.gate_required == 'true' && 'Yes - Security gate enforcement active' || 'No - Security criteria met' }}
+
+            ## 🛠️ Administrative Controls
+
+            ### Bypass Mechanisms Available
+            - **One-Time Gate Bypass:** ${{ secrets.WES_1Time_Bypass == 'TRUE' && '🚨 ACTIVE - Security gate will be skipped' || '✅ Not Active - Normal enforcement' }}
+            - **One-Time Exception:** Available after 30-minute polling period
+            - **Emergency Override:** Contact security team for critical deployments
+
+            ---
+            *Report generated by CloudBees Unify Security Assessment Engine v2.0*  
+            *Next Assessment: ${{ steps.fetch-vulns.outputs.gate_required == 'true' && 'Continuous monitoring during security gate polling' || 'Standard deployment monitoring' }}*
+          format: MARKDOWN
+  security-gate:
+    needs: security-check
+    if: ${{ secrets.WES_1Time_Bypass != 'TRUE' && needs.security-check.outputs.gate_required == 'true' }}
+    outputs:
+      gate_status: ${{ steps.security-polling.outputs.gate_status }}
+      final_very_high_count: ${{ steps.security-polling.outputs.final_very_high_count }}
+      final_high_count: ${{ steps.security-polling.outputs.final_high_count }}
+      poll_results: ${{ steps.security-polling.outputs.poll_results }}
+      success_path: ${{ steps.security-polling.outputs.success_path }}
+      improvement_rate: ${{ steps.security-polling.outputs.improvement_rate }}
+    steps:
+      - name: Enhanced Security Gate Polling
+        id: security-polling
+        uses: docker://alpine:latest
+        run: |
+          apk add --no-cache curl jq bc
+
+          echo "🚨 ENHANCED SECURITY GATE ACTIVATED 🚨"
+          echo "Dual-Threshold Monitoring System v2.0"
+          echo ""
+          echo "Initial Vulnerability Counts:"
+          echo "- VERY HIGH: ${{ needs.security-check.outputs.very_high_count }} (Target: <4)"
+          echo "- HIGH: ${{ needs.security-check.outputs.high_count }} (Target: <6)"
+          echo ""
+          echo "Success Criteria: VERY HIGH <4 OR HIGH <6"
+          echo "Polling: Every 5 minutes for 30 minutes (7 assessments total)"
+          echo "Smart Recommendation: ${{ needs.security-check.outputs.recommendation }}"
+          echo ""
+
+          # Initialize variables
+          POLL_RESULTS=""
+          GATE_STATUS="FAILED"
+          FINAL_VERY_HIGH=${{ needs.security-check.outputs.very_high_count }}
+          FINAL_HIGH=${{ needs.security-check.outputs.vuln_count }}
+          SUCCESS_PATH="NONE"
+          START_TIME=$(date +%s)
+          END_TIME=$((START_TIME + 1800))  # 30 minutes = 1800 seconds
+          POLL_COUNT=0
+
+          # Track initial counts for progress calculation
+          INITIAL_VERY_HIGH=${{ needs.security-check.outputs.very_high_count }}
+          INITIAL_HIGH=${{ needs.security-check.outputs.vuln_count }}
+
+          # Dynamic CloudBees context variables
+          COMPONENT_ID="${{ cloudbees.component.id }}"
+          ORG_ID="${{ cloudbees.org.id }}"
+          ENDPOINT_ID="e8c14f62-66e8-4846-a077-3b9a887a7255"
+          BRANCH_NAME="${{ cloudbees.scm.branch }}"
+
+          # Build API URL
+          API_URL="https://api.cloudbees.io/v1/resources/${ORG_ID}/endpoints/${ENDPOINT_ID}/asset-store/components/${COMPONENT_ID}/branches/${BRANCH_NAME}/issues"
+
+          # Enhanced polling loop with dual-threshold monitoring
+          while [ $(date +%s) -lt $END_TIME ]; do
+            POLL_COUNT=$((POLL_COUNT + 1))
+            POLL_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
+            ELAPSED_MIN=$(( (POLL_COUNT - 1) * 5 ))
+
+            echo "🔍 Enhanced Security Assessment Poll #${POLL_COUNT} (${ELAPSED_MIN}:00 elapsed)"
+
+            # Make API call to check current vulnerability counts
+            RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.CLOUDBEES_API_TOKEN }}" \
+            "${API_URL}?pagination.sort.order=1&pagination.sort.field_name=severity&pagination.page_length=100&pagination.page=1&triageStatus=UNREVIEWED")
+
+            # Extract current counts
+            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+              echo "❌ API Error during poll #${POLL_COUNT}: $(echo "$RESPONSE" | jq -r '.error')"
+              CURRENT_VERY_HIGH=${{ needs.security-check.outputs.very_high_count }}
+              CURRENT_HIGH=${{ needs.security-check.outputs.vuln_count }}
+            else
+              CURRENT_VERY_HIGH=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "VERY_HIGH")) | length')
+              CURRENT_HIGH=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "HIGH")) | length')
+            fi
+
+            echo "   VERY HIGH: ${CURRENT_VERY_HIGH} (was ${INITIAL_VERY_HIGH})"
+            echo "   HIGH: ${CURRENT_HIGH} (was ${INITIAL_HIGH})"
+
+            # Calculate progress
+            VERY_HIGH_PROGRESS=$((INITIAL_VERY_HIGH - CURRENT_VERY_HIGH))
+            HIGH_PROGRESS=$((INITIAL_HIGH - CURRENT_HIGH))
+
+            # Update final counts
+            FINAL_VERY_HIGH=$CURRENT_VERY_HIGH
+            FINAL_HIGH=$CURRENT_HIGH
+
+            # Build detailed poll results for evidence
+            POLL_RESULTS="${POLL_RESULTS}**Poll #${POLL_COUNT}** (${POLL_TIME})
+            - VERY HIGH: ${CURRENT_VERY_HIGH} vulnerabilities (${VERY_HIGH_PROGRESS} fixed)
+            - HIGH: ${CURRENT_HIGH} vulnerabilities (${HIGH_PROGRESS} fixed)"
+
+            # Check dual-threshold success criteria
+            SUCCESS_VERY_HIGH=false
+            SUCCESS_HIGH=false
+            
+            if [ $CURRENT_VERY_HIGH -lt 4 ]; then
+              SUCCESS_VERY_HIGH=true
+            fi
+            
+            if [ $CURRENT_HIGH -lt 6 ]; then
+              SUCCESS_HIGH=true
+            fi
+
+            # Determine success path
+            if [ "$SUCCESS_VERY_HIGH" = "true" ] && [ "$SUCCESS_HIGH" = "true" ]; then
+              echo "✅ SUCCESS: Both thresholds met (VERY HIGH <4 AND HIGH <6)"
+              POLL_RESULTS="${POLL_RESULTS} ✅ **PASSED - DUAL SUCCESS**"$'\n'
+              GATE_STATUS="PASSED"
+              SUCCESS_PATH="DUAL_SUCCESS"
+              break
+            elif [ "$SUCCESS_VERY_HIGH" = "true" ]; then
+              echo "✅ SUCCESS: VERY HIGH threshold met (${CURRENT_VERY_HIGH} <4)"
+              POLL_RESULTS="${POLL_RESULTS} ✅ **PASSED - VERY HIGH PATH**"$'\n'
+              GATE_STATUS="PASSED"
+              SUCCESS_PATH="VERY_HIGH_PATH"
+              break
+            elif [ "$SUCCESS_HIGH" = "true" ]; then
+              echo "✅ SUCCESS: HIGH threshold met (${CURRENT_HIGH} <6)"
+              POLL_RESULTS="${POLL_RESULTS} ✅ **PASSED - HIGH PATH**"$'\n'
+              GATE_STATUS="PASSED"
+              SUCCESS_PATH="HIGH_PATH"
+              break
+            else
+              echo "⚠️  Thresholds not met: VERY HIGH=${CURRENT_VERY_HIGH} (≥4), HIGH=${CURRENT_HIGH} (≥6)"
+              POLL_RESULTS="${POLL_RESULTS}"$'\n'
+            fi
+
+            # Break if we've done 7 polls
+            if [ $POLL_COUNT -ge 7 ]; then break; fi
+
+            # Wait 5 minutes before next poll
+            echo "⏰ Waiting 5 minutes before next assessment..."
+            sleep 300
+          done
+
+          # Calculate improvement rates
+          ELAPSED_HOURS=$(echo "scale=2; ($POLL_COUNT * 5) / 60" | bc)
+          if [ "$ELAPSED_HOURS" != "0" ]; then
+            VERY_HIGH_RATE=$(echo "scale=1; $VERY_HIGH_PROGRESS / $ELAPSED_HOURS" | bc)
+            HIGH_RATE=$(echo "scale=1; $HIGH_PROGRESS / $ELAPSED_HOURS" | bc)
+            IMPROVEMENT_RATE="VERY HIGH: ${VERY_HIGH_RATE}/hour, HIGH: ${HIGH_RATE}/hour"
+          else
+            IMPROVEMENT_RATE="Insufficient data for rate calculation"
+          fi
+
+          # Check for One-Time Vulnerability Exception after polling completes
+          if [ "$GATE_STATUS" = "FAILED" ]; then
+            echo ""
+            echo "🔍 Checking One-Time Vulnerability Exception..."
+            if [ "${{ secrets.WES_1Time_Exception }}" = "TRUE" ]; then
+              echo "🚨 ONE-TIME VULNERABILITY EXCEPTION GRANTED!"
+              echo "Security gate bypassed by administrative override"
+              GATE_STATUS="PASSED"
+              SUCCESS_PATH="EXCEPTION_OVERRIDE"
+              POLL_RESULTS="${POLL_RESULTS}**EXCEPTION GRANTED**: One-time vulnerability exception applied by administrator"$'\n'
+            else
+              echo "❌ No exception granted - Security gate enforcement active"
+            fi
+          fi
+
+          # Final status reporting
+          echo ""
+          if [ "$GATE_STATUS" = "PASSED" ]; then
+            echo "🎉 ENHANCED SECURITY GATE PASSED!"
+            echo "Success Path: $SUCCESS_PATH"
+            echo "Final VERY HIGH count: ${FINAL_VERY_HIGH}"
+            echo "Final HIGH count: ${FINAL_HIGH}"
+            echo "Improvement Rate: $IMPROVEMENT_RATE"
+          else
+            echo "❌ ENHANCED SECURITY GATE FAILED!"
+            echo "Final VERY HIGH count: ${FINAL_VERY_HIGH} (need <4)"
+            echo "Final HIGH count: ${FINAL_HIGH} (need <6)"
+            echo "Developer did not meet either security threshold within 30 minutes!"
+          fi
+
+          # Output results
+          echo "$GATE_STATUS" > $CLOUDBEES_OUTPUTS/gate_status
+          echo "$FINAL_VERY_HIGH" > $CLOUDBEES_OUTPUTS/final_very_high_count
+          echo "$FINAL_HIGH" > $CLOUDBEES_OUTPUTS/final_high_count
+          echo "$POLL_RESULTS" > $CLOUDBEES_OUTPUTS/poll_results
+          echo "$SUCCESS_PATH" > $CLOUDBEES_OUTPUTS/success_path
+          echo "$IMPROVEMENT_RATE" > $CLOUDBEES_OUTPUTS/improvement_rate
+
+          # Exit with error if gate failed
+          if [ "$GATE_STATUS" = "FAILED" ]; then
+            exit 1
+          fi
+
+      - name: Publish Enhanced Security Gate Evidence
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            # 🚨 Security Gate Polling Results - Comprehensive Analysis
+
+            ## Executive Summary
+            **Gate Status:** ${{ steps.security-polling.outputs.gate_status }}  
+            **Success Path:** ${{ steps.security-polling.outputs.success_path }}  
+            **Polling Duration:** 30 minutes (7 assessment intervals)  
+            **Success Criteria:** VERY HIGH < 4 OR HIGH < 6  
+            **Final Decision:** ${{ steps.security-polling.outputs.gate_status == 'PASSED' && '✅ APPROVED FOR DEPLOYMENT' || '❌ DEPLOYMENT BLOCKED' }}
+
+            ## 📊 Dual-Threshold Monitoring Results
+
+            ### Initial vs Final Comparison
+            | Metric | Initial | Final | Change | Status |
+            |--------|---------|-------|--------|--------|
+            | **VERY HIGH** | ${{ needs.security-check.outputs.very_high_count }} | ${{ steps.security-polling.outputs.final_very_high_count }} | ${{ needs.security-check.outputs.very_high_count - steps.security-polling.outputs.final_very_high_count }} | ${{ steps.security-polling.outputs.final_very_high_count < 4 && '✅ THRESHOLD MET' || '❌ EXCEEDS THRESHOLD' }} |
+            | **HIGH** | ${{ needs.security-check.outputs.vuln_count }} | ${{ steps.security-polling.outputs.final_high_count }} | ${{ needs.security-check.outputs.vuln_count - steps.security-polling.outputs.final_high_count }} | ${{ steps.security-polling.outputs.final_high_count < 6 && '✅ THRESHOLD MET' || '❌ EXCEEDS THRESHOLD' }} |
+
+            ## ⏱️ Detailed Polling Timeline
+
+            ### Assessment Intervals (Every 5 Minutes)
+            ${{ steps.security-polling.outputs.poll_results }}
+
+            ### Progress Analytics
+            - **Total Polling Time:** 30 minutes
+            - **Assessment Frequency:** Every 5 minutes  
+            - **Improvement Rate:** ${{ steps.security-polling.outputs.improvement_rate }}
+            - **Developer Strategy Analysis:** ${{ steps.security-polling.outputs.success_path == 'VERY_HIGH_PATH' && 'Successfully focused on VERY HIGH vulnerabilities (recommended path)' || steps.security-polling.outputs.success_path == 'HIGH_PATH' && 'Successfully focused on HIGH vulnerabilities' || steps.security-polling.outputs.success_path == 'DUAL_SUCCESS' && 'Exceeded expectations - met both thresholds' || steps.security-polling.outputs.success_path == 'EXCEPTION_OVERRIDE' && 'Administrative exception applied' || 'Unable to meet either threshold within time limit' }}
+
+            ## 🎯 Gate Decision Analysis
+
+            ### Success Path Achieved
+            ${{ steps.security-polling.outputs.success_path == 'VERY_HIGH_PATH' && '**VERY HIGH Path Success:** Developer reduced VERY HIGH vulnerabilities below threshold (<4)
+            - **Strategy Validation:** Confirmed faster path to deployment
+            - **Business Impact:** Minimal deployment delay, critical security issues resolved' || steps.security-polling.outputs.success_path == 'HIGH_PATH' && '**HIGH Path Success:** Developer reduced HIGH vulnerabilities below threshold (<6)
+            - **Strategy Validation:** Traditional approach successful
+            - **Business Impact:** Security standards met through comprehensive fixes' || steps.security-polling.outputs.success_path == 'DUAL_SUCCESS' && '**Dual Success:** Developer exceeded expectations by meeting both thresholds
+            - **Strategy Validation:** Comprehensive security improvement achieved
+            - **Business Impact:** Optimal security posture for production deployment' || steps.security-polling.outputs.success_path == 'EXCEPTION_OVERRIDE' && '**Administrative Override:** One-time exception granted after polling period
+            - **Justification Required:** Security team administrative decision
+            - **Business Impact:** Deployment approved with documented risk acceptance' || '**No Success Path:** Neither threshold met within 30-minute polling period
+            - **Business Impact:** Deployment blocked pending security remediation
+            - **Next Steps:** Additional development time required for vulnerability fixes' }}
+
+            ### Administrative Overrides
+            - **Exception Applied:** ${{ secrets.WES_1Time_Exception == 'TRUE' && '🚨 YES - One-time exception granted after polling' || '✅ No exceptions used - standard criteria applied' }}
+            - **Override Authority:** Security team administrative decision
+            - **Audit Trail:** Complete polling timeline documented above
+
+            ## 📈 Business Impact Assessment
+
+            ### Deployment Readiness
+            - **Production Approval:** ${{ steps.security-polling.outputs.gate_status == 'PASSED' && '✅ APPROVED - Security criteria met' || '❌ BLOCKED - Security criteria not met' }}
+            - **Risk Level:** ${{ steps.security-polling.outputs.final_very_high_count == 0 && steps.security-polling.outputs.final_high_count == 0 && 'MINIMAL' || steps.security-polling.outputs.final_very_high_count < 4 && steps.security-polling.outputs.final_high_count < 6 && 'ACCEPTABLE' || 'ELEVATED' }}  
+            - **Compliance Status:** ${{ steps.security-polling.outputs.gate_status == 'PASSED' && 'COMPLIANT - Meets security standards' || 'NON-COMPLIANT - Exceeds risk thresholds' }}
+            - **Next Steps:** ${{ steps.security-polling.outputs.gate_status == 'PASSED' && 'Proceed to production deployment with monitoring' || 'Block deployment pending additional security remediation' }}
+
+            ### Performance Metrics
+            - **Gate Efficiency:** ${{ steps.security-polling.outputs.success_path != 'NONE' && steps.security-polling.outputs.success_path != 'EXCEPTION_OVERRIDE' && 'High - Developer successfully met criteria' || 'Standard - Full polling period utilized' }}
+            - **Developer Experience:** ${{ steps.security-polling.outputs.success_path == 'VERY_HIGH_PATH' && 'Optimal - Followed smart recommendation' || steps.security-polling.outputs.success_path != 'NONE' && 'Positive - Achieved security goals' || 'Challenging - Additional effort required' }}
+            - **Security Posture:** Enhanced through dual-threshold monitoring system
+
+            ---
+            *Security Gate Report v2.0 - Enhanced Dual-Threshold Monitoring System*  
+            *Generated by CloudBees Unify Security Enforcement Engine*  
+            *Report Timestamp: ${{ steps.security-polling.outputs.poll_results && 'Complete assessment cycle' || 'Partial assessment data' }}*
+          format: MARKDOWN
+  deploy:
+    environment: DOW Production
+    steps:
+      - name: Checkout
+        uses: cloudbees-io/checkout@v1
+      - uses: cloudbees-days/setup-kubeconfig
+        name: Set kubeconfig
+        with:
+          kubeconfig: ${{ secrets.kubeconfig }}
+      - name: Deploy to cluster
+        uses: cloudbees-io/kustomize-deploy@v1
+        kind: deploy
+        with:
+          kustomization-base-dir: ${{ cloudbees.workspace }}/k8s/base
+          kustomization-overlays-dir: ${{ cloudbees.workspace }}/k8s/overlays/prod
+          environment-variables: "{}"
+      - name: Publish evidence
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            ## Deployed environment
+            [Production frontend](https://hackers-organized-prod.preview.cb-demos.io/)
+
+            Running hackers-organized:${{ cloudbees.scm.sha }}
+            **Artifact ID:** ${{ needs.build-container-image.outputs.ARTIFACT_ID }}
+          format: MARKDOWN
+      - name: Register deployed artifact
+        uses: cloudbees-io/register-deployed-artifact@v2
+        with:
+          artifact-id: ${{ needs.build-container-image.outputs.ARTIFACT_ID }}
+          target-environment: "DOW Production"
+    needs:
+      - build-container-image
+      - scan
+      - security-check
+      - security-gate
