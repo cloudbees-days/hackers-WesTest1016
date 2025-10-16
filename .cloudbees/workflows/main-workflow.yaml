@@ -32,6 +32,7 @@ jobs:
     steps:
       - name: Security Scan
         id: scan
+        uses: docker://alpine:latest
         run: |
           VERY_HIGH_COUNT=5
           HIGH_COUNT=8
@@ -41,6 +42,7 @@ jobs:
 
       - name: Evaluate Security Gate
         id: evaluate
+        uses: docker://alpine:latest
         run: |
           VERY_HIGH=${{ steps.scan.outputs.very-high-count }}
           HIGH=${{ steps.scan.outputs.high-count }}
@@ -65,6 +67,7 @@ jobs:
     if: needs.security-check.outputs.gate-triggered == 'true' && needs.security-check.outputs.bypass-active == 'false'
     steps:
       - name: Security Gate Polling
+        uses: docker://alpine:latest
         run: |
           POLL_COUNT=0
           MAX_POLLS=7
