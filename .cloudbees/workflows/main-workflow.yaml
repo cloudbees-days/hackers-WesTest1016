@@ -11,94 +11,12 @@ on:
         description: 'Bypass 30-minute security gate'
         type: boolean
         default: false
-
-env:
-  WES_1Time_Bypass: ${{ vars.WES_1Time_Bypass || 'false' }}
-  WES_1Time_Exception: ${{ vars.WES_1Time_Exception || 'false' }}
-
 permissions:
   scm-token-own: read
   scm-token-org: read
   id-token: write
-
 jobs:
-  security-check:
-    runs-on: cloudbees-runner
-    outputs:
-      very-high-count: ${{ steps.scan.outputs.very-high-count }}
-      high-count: ${{ steps.scan.outputs.high-count }}
-      gate-triggered: ${{ steps.evaluate.outputs.gate-triggered }}
-      bypass-active: ${{ steps.evaluate.outputs.bypass-active }}
-    steps:
-      - name: Security Scan
-        id: scan
-        uses: docker://alpine:latest
-        run: |
-          VERY_HIGH_COUNT=5
-          HIGH_COUNT=8
-          echo "very-high-count=${VERY_HIGH_COUNT}" >> $GITHUB_OUTPUT
-          echo "high-count=${HIGH_COUNT}" >> $GITHUB_OUTPUT
-          echo "Found ${VERY_HIGH_COUNT} VERY HIGH and ${HIGH_COUNT} HIGH vulnerabilities"
-
-      - name: Evaluate Security Gate
-        id: evaluate
-        uses: docker://alpine:latest
-        run: |
-          VERY_HIGH=${{ steps.scan.outputs.very-high-count }}
-          HIGH=${{ steps.scan.outputs.high-count }}
-          
-          if [ "${{ env.WES_1Time_Bypass }}" = "true" ]; then
-            echo "bypass-active=true" >> $GITHUB_OUTPUT
-            echo "gate-triggered=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          echo "bypass-active=false" >> $GITHUB_OUTPUT
-          
-          if [ "$VERY_HIGH" -ge 4 ] || [ "$HIGH" -ge 6 ]; then
-            echo "gate-triggered=true" >> $GITHUB_OUTPUT
-          else
-            echo "gate-triggered=false" >> $GITHUB_OUTPUT
-          fi
-
-  security-gate:
-    runs-on: cloudbees-runner
-    needs: security-check
-    if: needs.security-check.outputs.gate-triggered == 'true' && needs.security-check.outputs.bypass-active == 'false'
-    steps:
-      - name: Security Gate Polling
-        uses: docker://alpine:latest
-        run: |
-          POLL_COUNT=0
-          MAX_POLLS=7
-          
-          while [ $POLL_COUNT -lt $MAX_POLLS ]; do
-            POLL_COUNT=$((POLL_COUNT + 1))
-            echo "Poll $POLL_COUNT/7"
-            
-            VERY_HIGH_COUNT=3
-            HIGH_COUNT=5
-            
-            if [ "$VERY_HIGH_COUNT" -lt 4 ] && [ "$HIGH_COUNT" -lt 6 ]; then
-              echo "Security gate passed!"
-              exit 0
-            fi
-            
-            if [ "${{ env.WES_1Time_Exception }}" = "true" ]; then
-              echo "Security gate overridden via WES_1Time_Exception."
-              exit 0
-            fi
-            
-            if [ $POLL_COUNT -lt $MAX_POLLS ]; then
-              sleep 300
-            fi
-          done
-          
-          exit 1
-
   test:
-    needs: [security-check, security-gate]
-    if: always() && (needs.security-check.outputs.gate-triggered == 'false' || needs.security-check.outputs.bypass-active == 'true' || needs.security-gate.result == 'success')
     steps:
       - name: Run Jenkins Job
         kind: test
@@ -108,7 +26,7 @@ jobs:
           url: https://sda.preview.cb-demos.io/westest/
           username: ${{ secrets.WES_JENKINS_USERNAME }}
           token: ${{ secrets.WES_JENKINS_TOKEN }}
-          job-name: WesTestMB4/job/main/
+          job-name: WesTestJob
       - name: Run GHA Workflow
         uses: cloudbees-io/ghactions-run-workflow@v2
         continue-on-error: true
@@ -117,7 +35,7 @@ jobs:
           org-name: cloudbees-days
           repo-name: hackers-WesTest1016
           branch-name: main
-          workflow-name: test-and-build-image
+          workflow-name: test-and-build-image2
           test-type: JUnit
           test-result-location: junit.xml
       - name: Get source code
@@ -238,7 +156,7 @@ jobs:
         run: |
           apk add --no-cache curl jq
           curl -u ${{ secrets.SONAR_USER }}:${{ secrets.SONAR_TOKEN }} \
-          "https://sonarqube.cb-demos.io/api/issues/search?componentKeys=hackers-WesTest1016&severities=BLOCKER,CRITICAL,MAJOR,MINOR" \
+          "https://sonarqube.cb-demos.io/api/issues/search?componentKeys=HackersOrganized&severities=BLOCKER,CRITICAL,MAJOR,MINOR" \
           -o sonar-issues.json
           BLOCKER_COUNT=$(jq '[.issues[] | select(.severity=="BLOCKER")] | length' sonar-issues.json)
           CRITICAL_COUNT=$(jq '[.issues[] | select(.severity=="CRITICAL")] | length' sonar-issues.json)
@@ -262,3 +180,286 @@ jobs:
             | MAJOR_COUNT          | ${{ steps.FetchSonarQubeIssues.outputs.MAJOR_COUNT }} |
             | MINOR_COUNT          | ${{ steps.FetchSonarQubeIssues.outputs.MINOR_COUNT }} |
           format: MARKDOWN
+  security-check:
+    needs:
+      - build-container-image
+      - scan
+    outputs:
+      vuln_count: ${{ steps.fetch-vulns.outputs.vuln_count }}
+      severity_level: ${{ steps.fetch-vulns.outputs.severity_level }}
+      very_high_count: ${{ steps.fetch-vulns.outputs.very_high_count }}
+      high_count: ${{ steps.fetch-vulns.outputs.high_count }}
+      medium_count: ${{ steps.fetch-vulns.outputs.medium_count }}
+      low_count: ${{ steps.fetch-vulns.outputs.low_count }}
+      total_count: ${{ steps.fetch-vulns.outputs.total_count }}
+      scan_datetime: ${{ steps.fetch-vulns.outputs.scan_datetime }}
+    steps:
+      - name: Fetch Security Vulnerabilities
+        id: fetch-vulns
+        uses: docker://alpine:latest
+        run: |
+          apk add --no-cache curl jq
+
+          SCAN_DATETIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+          # Check bypass
+          if [ "${{ secrets.WES_1Time_Bypass }}" = "TRUE" ]; then
+            echo "🚨 ONE-TIME SECURITY GATE BYPASS GRANTED!"
+          else
+            echo "✅ No bypass active - normal security gate enforcement"
+          fi
+
+          # Dynamic CloudBees context variables
+          COMPONENT_ID="${{ cloudbees.component.id }}"
+          ORG_ID="${{ cloudbees.org.id }}"
+          ENDPOINT_ID="e8c14f62-66e8-4846-a077-3b9a887a7255"
+          BRANCH_NAME="${{ cloudbees.scm.branch }}"
+
+          echo "🔍 Using component: $COMPONENT_ID"
+          echo "🔍 Using branch: $BRANCH_NAME"
+
+          # Build CloudBees Unify REST API URL with branch name
+          API_URL="https://api.cloudbees.io/v1/resources/${ORG_ID}/endpoints/${ENDPOINT_ID}/asset-store/components/${COMPONENT_ID}/branches/${BRANCH_NAME}/issues"
+          echo "✅ CloudBees Unify API URL: $API_URL"
+
+          # Make vulnerability API call
+          RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.CLOUDBEES_API_TOKEN }}" \
+          "${API_URL}?pagination.sort.order=1&pagination.sort.field_name=severity&pagination.page_length=100&pagination.page=1&triageStatus=UNREVIEWED")
+
+          # Validate API response
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "❌ Vulnerability API Error: $(echo "$RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          # Extract vulnerability counts
+          VERY_HIGH_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "VERY_HIGH")) | length')
+          HIGH_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "HIGH")) | length')
+          MEDIUM_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "MEDIUM")) | length')
+          LOW_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "LOW")) | length')
+          TOTAL_COUNT=$(echo "$RESPONSE" | jq '.issues | length')
+
+          # Output results
+          echo "$HIGH_COUNT" > $CLOUDBEES_OUTPUTS/vuln_count
+          echo "$VERY_HIGH_COUNT" > $CLOUDBEES_OUTPUTS/very_high_count
+          echo "$HIGH_COUNT" > $CLOUDBEES_OUTPUTS/high_count
+          echo "$MEDIUM_COUNT" > $CLOUDBEES_OUTPUTS/medium_count
+          echo "$LOW_COUNT" > $CLOUDBEES_OUTPUTS/low_count
+          echo "$TOTAL_COUNT" > $CLOUDBEES_OUTPUTS/total_count
+          echo "$SCAN_DATETIME" > $CLOUDBEES_OUTPUTS/scan_datetime
+          echo "HIGH" > $CLOUDBEES_OUTPUTS/severity_level
+
+          echo "🔍 Security Scan Results:"
+          echo "- VERY HIGH Vulnerabilities: $VERY_HIGH_COUNT"
+          echo "- HIGH Vulnerabilities: $HIGH_COUNT"
+          echo "- MEDIUM Vulnerabilities: $MEDIUM_COUNT"
+          echo "- LOW Vulnerabilities: $LOW_COUNT"
+          echo "- TOTAL Vulnerabilities: $TOTAL_COUNT"
+
+          if [ "${{ secrets.WES_1Time_Bypass }}" = "TRUE" ]; then
+            echo "- Security Gate: BYPASSED (Admin override)"
+          else
+            echo "- Security Gate Required: $([ $HIGH_COUNT -ge 6 ] && echo 'YES (≥6 High)' || echo 'NO (<6 High)')"
+          fi
+
+      - name: Generate Security Evidence Report
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            # Security Vulnerability Report
+
+            **Component:** ${{ cloudbees.component.id }}
+            **Security Check Date & Time:** ${{ steps.fetch-vulns.outputs.scan_datetime }}
+            **Total Vulnerabilities:** ${{ steps.fetch-vulns.outputs.total_count }}
+            **Data Source:** Real-time CloudBees Unify REST API
+
+            ## Severity Breakdown
+            | Severity | Count |
+            |----------|-------|
+            | Very High | ${{ steps.fetch-vulns.outputs.very_high_count }} |
+            | High | ${{ steps.fetch-vulns.outputs.high_count }} |
+            | Medium | ${{ steps.fetch-vulns.outputs.medium_count }} |
+            | Low | ${{ steps.fetch-vulns.outputs.low_count }} |
+            | **TOTAL** | ${{ steps.fetch-vulns.outputs.total_count }} |
+
+            ## Security Gate Decision
+            One-time bypass check: Administrative override capability available
+
+            ## Risk Assessment
+            - **Critical Risk**: ${{ steps.fetch-vulns.outputs.very_high_count }} Very High vulnerabilities
+            - **High Risk**: ${{ steps.fetch-vulns.outputs.high_count }} High severity vulnerabilities
+            - **Total Risk**: All ${{ steps.fetch-vulns.outputs.total_count }} vulnerabilities require attention
+          format: MARKDOWN
+  security-gate:
+    needs: security-check
+    if: ${{ secrets.WES_1Time_Bypass != 'TRUE' }}
+    outputs:
+      gate_status: ${{ steps.security-polling.outputs.gate_status }}
+      final_vuln_count: ${{ steps.security-polling.outputs.final_vuln_count }}
+      poll_results: ${{ steps.security-polling.outputs.poll_results }}
+    steps:
+      - name: Security Gate Polling
+        id: security-polling
+        uses: docker://alpine:latest
+        run: |
+          apk add --no-cache curl jq
+
+          echo "🚨 SECURITY GATE ACTIVATED 🚨"
+          echo "Initial High Vulnerabilities: ${{ needs.security-check.outputs.vuln_count }}"
+          echo "Threshold: Must be <6 to proceed"
+          echo "Polling: Every 5 minutes for 30 minutes (7 polls total)"
+          echo ""
+
+          # Initialize variables
+          POLL_RESULTS=""
+          GATE_STATUS="FAILED"
+          FINAL_COUNT=${{ needs.security-check.outputs.vuln_count }}
+          START_TIME=$(date +%s)
+          END_TIME=$((START_TIME + 1800))  # 30 minutes = 1800 seconds
+          POLL_COUNT=0
+
+          # Dynamic CloudBees context variables (same as security-check)
+          COMPONENT_ID="${{ cloudbees.component.id }}"
+          ORG_ID="${{ cloudbees.org.id }}"
+          ENDPOINT_ID="e8c14f62-66e8-4846-a077-3b9a887a7255"
+          BRANCH_NAME="${{ cloudbees.scm.branch }}"
+
+          # Build API URL with branch name
+          API_URL="https://api.cloudbees.io/v1/resources/${ORG_ID}/endpoints/${ENDPOINT_ID}/asset-store/components/${COMPONENT_ID}/branches/${BRANCH_NAME}/issues"
+
+          # Polling loop - exactly 30 minutes with 5-minute intervals
+          while [ $(date +%s) -lt $END_TIME ]; do
+            POLL_COUNT=$((POLL_COUNT + 1))
+            POLL_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
+            ELAPSED_MIN=$(( (POLL_COUNT - 1) * 5 ))
+
+            echo "🔍 High Security Check Poll #${POLL_COUNT} (${ELAPSED_MIN}:00 elapsed)"
+
+            # Make API call to check current vulnerability count
+            RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.CLOUDBEES_API_TOKEN }}" \
+            "${API_URL}?pagination.sort.order=1&pagination.sort.field_name=severity&pagination.page_length=100&pagination.page=1&triageStatus=UNREVIEWED")
+
+            # Extract current High count
+            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+              echo "❌ API Error during poll #${POLL_COUNT}: $(echo "$RESPONSE" | jq -r '.error')"
+              CURRENT_COUNT=${{ needs.security-check.outputs.vuln_count }}
+            else
+              CURRENT_COUNT=$(echo "$RESPONSE" | jq '.issues | map(select(.severity == "HIGH")) | length')
+            fi
+
+            echo "   Result: ${CURRENT_COUNT} High vulnerabilities"
+            FINAL_COUNT=$CURRENT_COUNT
+
+            # Build poll results for evidence
+            POLL_RESULTS="${POLL_RESULTS}- **Poll #${POLL_COUNT}** (${POLL_TIME}): ${CURRENT_COUNT} High vulnerabilities"
+
+            # Check if we've met the criteria - Success threshold < 6 for HIGH
+            if [ $CURRENT_COUNT -lt 6 ]; then
+              echo "✅ SUCCESS: High vulnerabilities reduced to ${CURRENT_COUNT} (<6)"
+              POLL_RESULTS="${POLL_RESULTS} ✅ **PASSED**"$'\n'
+              GATE_STATUS="PASSED"
+              break
+            else
+              echo "⚠️  Still ${CURRENT_COUNT} High vulnerabilities (≥6)"
+              POLL_RESULTS="${POLL_RESULTS}"$'\n'
+            fi
+
+            # Break if we've done 7 polls
+            if [ $POLL_COUNT -ge 7 ]; then break; fi
+
+            # Wait 5 minutes before next poll
+            echo "⏰ Waiting 5 minutes before next poll..."
+            sleep 300
+          done
+
+          # Check for One-Time Vulnerability Exception after polling completes
+          if [ "$GATE_STATUS" = "FAILED" ]; then
+            echo ""
+            echo "🔍 Checking One-Time Vulnerability Exception..."
+            if [ "${{ secrets.WES_1Time_Exception }}" = "TRUE" ]; then
+              echo "🚨 ONE-TIME VULNERABILITY EXCEPTION GRANTED!"
+              echo "Security gate bypassed by administrative override"
+              GATE_STATUS="PASSED"
+              POLL_RESULTS="${POLL_RESULTS}- **EXCEPTION GRANTED**: One-time vulnerability exception applied"$'\n'
+            else
+              echo "❌ No exception granted - Security gate enforcement active"
+            fi
+          fi
+
+          # Final status
+          if [ "$GATE_STATUS" = "PASSED" ]; then
+            echo ""
+            echo "🎉 SECURITY GATE PASSED!"
+            echo "Final High vulnerability count: ${FINAL_COUNT}"
+          else
+            echo ""
+            echo "❌ SECURITY GATE FAILED!"
+            echo "Final High vulnerability count: ${FINAL_COUNT}"
+            echo "Developer did not meet the Security Criteria of fixing High Vulnerabilities!"
+          fi
+
+          # Output results
+          echo "$GATE_STATUS" > $CLOUDBEES_OUTPUTS/gate_status
+          echo "$FINAL_COUNT" > $CLOUDBEES_OUTPUTS/final_vuln_count
+          echo "$POLL_RESULTS" > $CLOUDBEES_OUTPUTS/poll_results
+
+          # Exit with error if gate failed
+          if [ "$GATE_STATUS" = "FAILED" ]; then
+            exit 1
+          fi
+
+      - name: Publish Security Gate Evidence
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            # Security Gate Polling Results
+
+            **Gate Status:** ${{ steps.security-polling.outputs.gate_status }}
+            **Initial High Count:** ${{ needs.security-check.outputs.vuln_count }}
+            **Final High Count:** ${{ steps.security-polling.outputs.final_vuln_count }}
+            **Polling Duration:** 30 minutes (7 polls every 5 minutes)
+
+            ## Polling Timeline
+            ${{ steps.security-polling.outputs.poll_results }}
+
+            ## Gate Decision
+            Security gate threshold: <6 High vulnerabilities required to proceed
+
+            **Result:** Deployment status based on final vulnerability count
+          format: MARKDOWN
+  deploy:
+    environment: DOW Production
+    steps:
+      - name: Checkout
+        uses: cloudbees-io/checkout@v1
+      - uses: cloudbees-days/setup-kubeconfig
+        name: Set kubeconfig
+        with:
+          kubeconfig: ${{ secrets.kubeconfig }}
+      - name: Deploy to cluster
+        uses: cloudbees-io/kustomize-deploy@v1
+        kind: deploy
+        with:
+          kustomization-base-dir: ${{ cloudbees.workspace }}/k8s/base
+          kustomization-overlays-dir: ${{ cloudbees.workspace }}/k8s/overlays/prod
+          environment-variables: "{}"
+      - name: Publish evidence
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            ## Deployed environment
+            [Production frontend](https://hackers-organized-prod.preview.cb-demos.io/)
+
+            Running hackers-organized:${{ cloudbees.scm.sha }}
+            **Artifact ID:** ${{ needs.build-container-image.outputs.ARTIFACT_ID }}
+          format: MARKDOWN
+      - name: Register deployed artifact
+        uses: cloudbees-io/register-deployed-artifact@v2
+        with:
+          artifact-id: ${{ needs.build-container-image.outputs.ARTIFACT_ID }}
+          target-environment: "DOW Production"
+    needs:
+      - build-container-image
+      - scan
+      - security-check
+      - security-gate
